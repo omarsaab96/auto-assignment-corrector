@@ -11,6 +11,7 @@ from typing import Iterable
 
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
+from openpyxl.utils import get_column_letter
 
 
 DEFAULT_TEMPLATE_NAME = "Jarir - 3 Statement - Assignment.Sol.xlsx"
@@ -51,19 +52,47 @@ def iter_excel_files(students_dir: Path, template_path: Path) -> Iterable[Path]:
         yield path
 
 
-def max_used_bounds(template_ws, student_ws) -> tuple[int, int]:
-    return (
-        max(template_ws.max_row or 1, student_ws.max_row or 1),
-        max(template_ws.max_column or 1, student_ws.max_column or 1),
-    )
-
-
 def values_match(expected: object, actual: object, args: argparse.Namespace) -> bool:
     return normalize_value(expected, ignore_case=args.ignore_case, trim_text=args.trim_text) == normalize_value(
         actual,
         ignore_case=args.ignore_case,
         trim_text=args.trim_text,
     )
+
+
+def cell_coordinate(row: int, column: int) -> str:
+    return f"{get_column_letter(column)}{row}"
+
+
+def read_only_non_empty_values(worksheet) -> dict[tuple[int, int], object]:
+    values: dict[tuple[int, int], object] = {}
+    for row_index, row in enumerate(worksheet.iter_rows(), start=1):
+        for column_index, cell in enumerate(row, start=1):
+            if cell.value is not None:
+                values[(row_index, column_index)] = cell.value
+    return values
+
+
+def editable_non_empty_values(worksheet) -> dict[tuple[int, int], object]:
+    values: dict[tuple[int, int], object] = {}
+    for position, cell in worksheet._cells.items():
+        if cell.value is not None:
+            values[position] = cell.value
+    return values
+
+
+def template_value_cache(template_wb) -> dict[str, dict[tuple[int, int], object]]:
+    cached = getattr(template_wb, "_assignment_corrector_value_cache", None)
+    if cached is not None:
+        return cached
+
+    cached = {}
+    for sheet_name in template_wb.sheetnames:
+        if sheet_name == REPORT_SHEET_NAME:
+            continue
+        cached[sheet_name] = read_only_non_empty_values(template_wb[sheet_name])
+    setattr(template_wb, "_assignment_corrector_value_cache", cached)
+    return cached
 
 
 def add_report_sheet(workbook, differences: list[Difference]) -> None:
@@ -99,11 +128,8 @@ def grade_workbook(template_wb, student_path: Path, corrected_dir: Path, args: a
     differences: list[Difference] = []
 
     try:
-        for sheet_name in template_wb.sheetnames:
-            if sheet_name == REPORT_SHEET_NAME:
-                continue
-
-            template_ws = template_wb[sheet_name]
+        template_values_by_sheet = template_value_cache(template_wb)
+        for sheet_name, template_values in template_values_by_sheet.items():
             if sheet_name not in student_wb.sheetnames:
                 differences.append(
                     Difference(
@@ -118,32 +144,30 @@ def grade_workbook(template_wb, student_path: Path, corrected_dir: Path, args: a
                 continue
 
             student_ws = student_wb[sheet_name]
-            max_row, max_column = max_used_bounds(template_ws, student_ws)
+            student_values = editable_non_empty_values(student_ws)
 
-            for row in range(1, max_row + 1):
-                for column in range(1, max_column + 1):
-                    template_cell = template_ws.cell(row=row, column=column)
-                    student_cell = student_ws.cell(row=row, column=column)
-                    expected = template_cell.value
-                    actual = student_cell.value
+            for row, column in sorted(template_values.keys() | student_values.keys()):
+                expected = template_values.get((row, column))
+                actual = student_values.get((row, column))
 
-                    if values_match(expected, actual, args):
-                        continue
+                if values_match(expected, actual, args):
+                    continue
 
-                    student_cell.fill = DIFF_FILL if expected is not None else MISSING_FILL
-                    differences.append(
-                        Difference(
-                            workbook=student_path.name,
-                            sheet=sheet_name,
-                            cell=student_cell.coordinate,
-                            expected=display_value(expected),
-                            actual=display_value(actual),
-                            issue="different value",
-                        )
+                student_cell = student_ws.cell(row=row, column=column)
+                student_cell.fill = DIFF_FILL if expected is not None else MISSING_FILL
+                differences.append(
+                    Difference(
+                        workbook=student_path.name,
+                        sheet=sheet_name,
+                        cell=cell_coordinate(row, column),
+                        expected=display_value(expected),
+                        actual=display_value(actual),
+                        issue="different value",
                     )
+                )
 
         for sheet_name in student_wb.sheetnames:
-            if sheet_name not in template_wb.sheetnames and sheet_name != REPORT_SHEET_NAME:
+            if sheet_name not in template_values_by_sheet and sheet_name != REPORT_SHEET_NAME:
                 differences.append(
                     Difference(
                         workbook=student_path.name,

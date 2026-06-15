@@ -22,7 +22,7 @@ from googleapiclient.discovery import build
 from openpyxl import load_workbook
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from grade_assignments import DEFAULT_TEMPLATE_NAME, Difference, grade_workbook
+from grade_assignments import DEFAULT_TEMPLATE_NAME, Difference, grade_workbook, template_value_cache
 from grade_google_drive import (
     DEFAULT_CORRECTED_FOLDER_PREFIX,
     FOLDER_MIME_TYPE,
@@ -1311,6 +1311,7 @@ def grade_drive_files(service, form: dict[str, object], template: dict, students
         download_file(service, template["id"], template_path)
         template_wb = load_workbook(template_path, read_only=True, keep_links=False)
         try:
+            template_value_cache(template_wb)
             grade_args = SimpleNamespace(ignore_case=form["ignore_case"], trim_text=form["trim_text"])
 
             preview_differences: list[Difference] = []
@@ -1437,6 +1438,8 @@ def run_correction_job(job_id: str, form: dict[str, object], credentials_data: d
             download_file(service, template["id"], template_path)
             template_wb = load_workbook(template_path, read_only=True, keep_links=False)
             try:
+                update_job(job_id, stage="Reading solution workbook values...")
+                template_value_cache(template_wb)
                 grade_args = SimpleNamespace(ignore_case=form["ignore_case"], trim_text=form["trim_text"])
 
                 corrected_paths: list[tuple[dict, Path]] = []

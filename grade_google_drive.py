@@ -17,7 +17,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from openpyxl import load_workbook
 
-from grade_assignments import DEFAULT_TEMPLATE_NAME, Difference, grade_workbook, write_summary
+from grade_assignments import DEFAULT_TEMPLATE_NAME, Difference, grade_workbook, template_value_cache, write_summary
 
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -294,6 +294,7 @@ def main() -> int:
         download_file(service, template_file["id"], template_path)
         template_wb = load_workbook(template_path, read_only=True, keep_links=False)
         try:
+            template_value_cache(template_wb)
             all_differences: list[Difference] = []
             grade_args = make_grade_args(args)
 
