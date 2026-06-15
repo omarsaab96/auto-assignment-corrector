@@ -684,6 +684,15 @@ PAGE = """
       </section>
     </div>
 
+    <section id="completion-summary" class="panel hidden" style="margin-top:18px;">
+      <div class="summary">
+        <div class="metric"><strong id="completion-graded-count">0</strong><span>workbooks corrected</span></div>
+        <div class="metric"><strong id="completion-difference-count">0</strong><span>different cells or sheets</span></div>
+        <div class="metric"><strong id="completion-output-folder">-</strong><span>Drive output folder</span></div>
+      </div>
+      <div id="completion-message" class="message success">Correction finished.</div>
+    </section>
+
     <section id="progress-panel" class="panel progress-panel hidden">
       <div class="progress-head">
         <div>
@@ -757,6 +766,11 @@ PAGE = """
     const browserRefresh = document.getElementById("browser-refresh");
     const workArea = document.getElementById("work-area");
     const correctionForm = document.getElementById("correction-form");
+    const completionSummary = document.getElementById("completion-summary");
+    const completionGradedCount = document.getElementById("completion-graded-count");
+    const completionDifferenceCount = document.getElementById("completion-difference-count");
+    const completionOutputFolder = document.getElementById("completion-output-folder");
+    const completionMessage = document.getElementById("completion-message");
     const progressPanel = document.getElementById("progress-panel");
     const progressTitle = document.getElementById("progress-title");
     const progressStage = document.getElementById("progress-stage");
@@ -973,6 +987,14 @@ PAGE = """
       progressMessage.classList.remove("hidden");
     }
 
+    function showCompletionSummary(job) {
+      completionGradedCount.textContent = job.completed || job.total || 0;
+      completionDifferenceCount.textContent = job.total_differences || 0;
+      completionOutputFolder.textContent = job.corrected_folder_name || "-";
+      completionMessage.textContent = `Correction finished. Output folder: ${job.corrected_folder_name || "-"}`;
+      completionSummary.classList.remove("hidden");
+    }
+
     function renderJob(job) {
       const total = job.total || job.submissions.length || 0;
       const completed = job.completed || 0;
@@ -1013,7 +1035,9 @@ PAGE = """
         progressLabel.textContent = "100%";
         progressLoader.classList.add("hidden");
         cancelCorrection.disabled = true;
-        showProgressMessage("success", `Correction finished. Output folder: ${job.corrected_folder_name}`);
+        showCompletionSummary(job);
+        progressPanel.classList.add("hidden");
+        workArea.classList.remove("hidden");
       } else if (job.status === "error") {
         progressLoader.classList.add("hidden");
         cancelCorrection.disabled = true;
@@ -1061,6 +1085,7 @@ PAGE = """
       event.preventDefault();
       correctionCancelled = false;
       activeJobId = null;
+      completionSummary.classList.add("hidden");
       progressMessage.classList.add("hidden");
       progressLoader.classList.remove("hidden");
       cancelCorrection.disabled = false;
