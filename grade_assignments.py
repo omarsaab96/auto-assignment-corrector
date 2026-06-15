@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import shutil
 import sys
 from dataclasses import dataclass
@@ -94,67 +95,72 @@ def grade_workbook(template_wb, student_path: Path, corrected_dir: Path, args: a
     output_path = corrected_dir / student_path.name
     shutil.copy2(student_path, output_path)
 
-    student_wb = load_workbook(output_path)
+    student_wb = load_workbook(output_path, keep_links=False)
     differences: list[Difference] = []
 
-    for sheet_name in template_wb.sheetnames:
-        if sheet_name == REPORT_SHEET_NAME:
-            continue
+    try:
+        for sheet_name in template_wb.sheetnames:
+            if sheet_name == REPORT_SHEET_NAME:
+                continue
 
-        template_ws = template_wb[sheet_name]
-        if sheet_name not in student_wb.sheetnames:
-            differences.append(
-                Difference(
-                    workbook=student_path.name,
-                    sheet=sheet_name,
-                    cell="",
-                    expected="Sheet exists",
-                    actual="Sheet missing",
-                    issue="missing sheet",
-                )
-            )
-            continue
-
-        student_ws = student_wb[sheet_name]
-        max_row, max_column = max_used_bounds(template_ws, student_ws)
-
-        for row in range(1, max_row + 1):
-            for column in range(1, max_column + 1):
-                template_cell = template_ws.cell(row=row, column=column)
-                student_cell = student_ws.cell(row=row, column=column)
-                expected = template_cell.value
-                actual = student_cell.value
-
-                if values_match(expected, actual, args):
-                    continue
-
-                student_cell.fill = DIFF_FILL if expected is not None else MISSING_FILL
+            template_ws = template_wb[sheet_name]
+            if sheet_name not in student_wb.sheetnames:
                 differences.append(
                     Difference(
                         workbook=student_path.name,
                         sheet=sheet_name,
-                        cell=student_cell.coordinate,
-                        expected=display_value(expected),
-                        actual=display_value(actual),
-                        issue="different value",
+                        cell="",
+                        expected="Sheet exists",
+                        actual="Sheet missing",
+                        issue="missing sheet",
+                    )
+                )
+                continue
+
+            student_ws = student_wb[sheet_name]
+            max_row, max_column = max_used_bounds(template_ws, student_ws)
+
+            for row in range(1, max_row + 1):
+                for column in range(1, max_column + 1):
+                    template_cell = template_ws.cell(row=row, column=column)
+                    student_cell = student_ws.cell(row=row, column=column)
+                    expected = template_cell.value
+                    actual = student_cell.value
+
+                    if values_match(expected, actual, args):
+                        continue
+
+                    student_cell.fill = DIFF_FILL if expected is not None else MISSING_FILL
+                    differences.append(
+                        Difference(
+                            workbook=student_path.name,
+                            sheet=sheet_name,
+                            cell=student_cell.coordinate,
+                            expected=display_value(expected),
+                            actual=display_value(actual),
+                            issue="different value",
+                        )
+                    )
+
+        for sheet_name in student_wb.sheetnames:
+            if sheet_name not in template_wb.sheetnames and sheet_name != REPORT_SHEET_NAME:
+                differences.append(
+                    Difference(
+                        workbook=student_path.name,
+                        sheet=sheet_name,
+                        cell="",
+                        expected="Sheet absent",
+                        actual="Extra sheet exists",
+                        issue="extra sheet",
                     )
                 )
 
-    for sheet_name in student_wb.sheetnames:
-        if sheet_name not in template_wb.sheetnames and sheet_name != REPORT_SHEET_NAME:
-            differences.append(
-                Difference(
-                    workbook=student_path.name,
-                    sheet=sheet_name,
-                    cell="",
-                    expected="Sheet absent",
-                    actual="Extra sheet exists",
-                    issue="extra sheet",
-                )
-            )
+        add_report_sheet(student_wb, differences)
+        student_wb.save(output_path)
+    finally:
+        student_wb.close()
+        gc.collect()
 
-    add_report_sheet(student_wb, differences)
-    student_wb.save(output_path)
     return differences
 
 
@@ -235,15 +241,19 @@ def main() -> int:
         return 1
 
     corrected_dir.mkdir(parents=True, exist_ok=True)
-    template_wb = load_workbook(template_path)
-    all_differences: list[Difference] = []
-    graded_count = 0
+    template_wb = load_workbook(template_path, read_only=True, keep_links=False)
+    try:
+        all_differences: list[Difference] = []
+        graded_count = 0
 
-    for student_path in iter_excel_files(students_dir, template_path):
-        graded_count += 1
-        differences = grade_workbook(template_wb, student_path, corrected_dir, args)
-        all_differences.extend(differences)
-        print(f"{student_path.name}: {len(differences)} difference(s)")
+        for student_path in iter_excel_files(students_dir, template_path):
+            graded_count += 1
+            differences = grade_workbook(template_wb, student_path, corrected_dir, args)
+            all_differences.extend(differences)
+            print(f"{student_path.name}: {len(differences)} difference(s)")
+            gc.collect()
+    finally:
+        template_wb.close()
 
     summary_path = write_summary(corrected_dir, all_differences)
     print(f"Graded {graded_count} workbook(s).")

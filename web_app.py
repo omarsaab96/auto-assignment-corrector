@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gc
 import json
 import logging
 import os
@@ -1308,32 +1309,37 @@ def grade_drive_files(service, form: dict[str, object], template: dict, students
 
         template_path = temp_dir / template["name"]
         download_file(service, template["id"], template_path)
-        template_wb = load_workbook(template_path)
-        grade_args = SimpleNamespace(ignore_case=form["ignore_case"], trim_text=form["trim_text"])
+        template_wb = load_workbook(template_path, read_only=True, keep_links=False)
+        try:
+            grade_args = SimpleNamespace(ignore_case=form["ignore_case"], trim_text=form["trim_text"])
 
-        preview_differences: list[Difference] = []
-        difference_counts: dict[str, int] = {}
-        total_differences = 0
-        summary_path = create_summary_file(corrected_dir)
+            preview_differences: list[Difference] = []
+            difference_counts: dict[str, int] = {}
+            total_differences = 0
+            summary_path = create_summary_file(corrected_dir)
 
-        for student in students:
-            student_source_dir = students_dir / student["id"]
-            student_source_dir.mkdir()
-            student_path = student_source_dir / student["name"]
-            download_file(service, student["id"], student_path)
-            student_corrected_dir = corrected_dir / student["id"]
-            student_corrected_dir.mkdir()
-            differences = grade_workbook(template_wb, student_path, student_corrected_dir, grade_args)
-            difference_counts[student["relative_path"]] = len(differences)
-            total_differences += len(differences)
-            append_summary_rows(summary_path, student["relative_path"], differences)
-            add_preview_differences(preview_differences, student["relative_path"], differences)
+            for student in students:
+                student_source_dir = students_dir / student["id"]
+                student_source_dir.mkdir()
+                student_path = student_source_dir / student["name"]
+                download_file(service, student["id"], student_path)
+                student_corrected_dir = corrected_dir / student["id"]
+                student_corrected_dir.mkdir()
+                differences = grade_workbook(template_wb, student_path, student_corrected_dir, grade_args)
+                difference_counts[student["relative_path"]] = len(differences)
+                total_differences += len(differences)
+                append_summary_rows(summary_path, student["relative_path"], differences)
+                add_preview_differences(preview_differences, student["relative_path"], differences)
 
-            corrected_path = student_corrected_dir / student_path.name
-            destination_folder_id = corrected_destination_folder(service, corrected_folder_id, student)
-            upload_or_replace_file(service, destination_folder_id, corrected_path, XLSX_MIME_TYPE)
+                corrected_path = student_corrected_dir / student_path.name
+                destination_folder_id = corrected_destination_folder(service, corrected_folder_id, student)
+                upload_or_replace_file(service, destination_folder_id, corrected_path, XLSX_MIME_TYPE)
+                gc.collect()
 
-        upload_summary_text(service, corrected_folder_id, summary_path)
+            upload_summary_text(service, corrected_folder_id, summary_path)
+        finally:
+            template_wb.close()
+            gc.collect()
 
     return {
         "graded_count": len(students),
@@ -1429,54 +1435,71 @@ def run_correction_job(job_id: str, form: dict[str, object], credentials_data: d
 
             template_path = temp_dir / template["name"]
             download_file(service, template["id"], template_path)
-            template_wb = load_workbook(template_path)
-            grade_args = SimpleNamespace(ignore_case=form["ignore_case"], trim_text=form["trim_text"])
+            template_wb = load_workbook(template_path, read_only=True, keep_links=False)
+            try:
+                grade_args = SimpleNamespace(ignore_case=form["ignore_case"], trim_text=form["trim_text"])
 
-            corrected_paths: list[tuple[dict, Path]] = []
-            total_differences = 0
-            summary_path = create_summary_file(corrected_dir)
+                corrected_paths: list[tuple[dict, Path]] = []
+                total_differences = 0
+                summary_path = create_summary_file(corrected_dir)
 
-            for index, student in enumerate(students):
+                for index, student in enumerate(students):
+                    if job_cancel_requested(job_id):
+                        update_job(job_id, status="cancelled", stage="Correction cancelled.")
+                        return
+
+                    current_index = index
+                    update_submission(job_id, index, status="running")
+                    update_job(job_id, stage=f"Correcting {student['relative_path']}...")
+
+                    student_source_dir = students_dir / student["id"]
+                    student_source_dir.mkdir()
+                    student_path = student_source_dir / student["name"]
+                    download_file(service, student["id"], student_path)
+
+                    student_corrected_dir = corrected_dir / student["id"]
+                    student_corrected_dir.mkdir()
+                    differences = grade_workbook(template_wb, student_path, student_corrected_dir, grade_args)
+                    total_differences += len(differences)
+                    append_summary_rows(summary_path, student["relative_path"], differences)
+                    corrected_path = student_corrected_dir / student_path.name
+                    corrected_paths.append((student, corrected_path))
+
+                    with JOBS_LOCK:
+                        JOBS[job_id]["completed"] += 1
+                        JOBS[job_id]["total_differences"] = total_differences
+                    update_submission(job_id, index, status="done", differences=len(differences))
+                    gc.collect()
+
                 if job_cancel_requested(job_id):
                     update_job(job_id, status="cancelled", stage="Correction cancelled.")
                     return
 
-                current_index = index
-                update_submission(job_id, index, status="running")
-                update_job(job_id, stage=f"Correcting {student['relative_path']}...")
+                update_job(job_id, stage="Preparing Drive output folder...")
+                corrected_folder_id = find_or_create_corrected_folder(
+                    service,
+                    str(form["students_folder_id"]),
+                    corrected_folder_name,
+                )
+                update_job(job_id, corrected_folder_id=corrected_folder_id)
 
-                student_source_dir = students_dir / student["id"]
-                student_source_dir.mkdir()
-                student_path = student_source_dir / student["name"]
-                download_file(service, student["id"], student_path)
+                try:
+                    for student, corrected_path in corrected_paths:
+                        if job_cancel_requested(job_id):
+                            trash_drive_file(service, corrected_folder_id)
+                            update_job(
+                                job_id,
+                                status="cancelled",
+                                corrected_folder_id="",
+                                stage="Correction cancelled. No corrected folder was kept.",
+                            )
+                            return
 
-                student_corrected_dir = corrected_dir / student["id"]
-                student_corrected_dir.mkdir()
-                differences = grade_workbook(template_wb, student_path, student_corrected_dir, grade_args)
-                total_differences += len(differences)
-                append_summary_rows(summary_path, student["relative_path"], differences)
-                corrected_path = student_corrected_dir / student_path.name
-                corrected_paths.append((student, corrected_path))
+                        update_job(job_id, stage=f"Uploading {student['relative_path']}...")
+                        destination_folder_id = corrected_destination_folder(service, corrected_folder_id, student)
+                        upload_or_replace_file(service, destination_folder_id, corrected_path, XLSX_MIME_TYPE)
+                        gc.collect()
 
-                with JOBS_LOCK:
-                    JOBS[job_id]["completed"] += 1
-                    JOBS[job_id]["total_differences"] = total_differences
-                update_submission(job_id, index, status="done", differences=len(differences))
-
-            if job_cancel_requested(job_id):
-                update_job(job_id, status="cancelled", stage="Correction cancelled.")
-                return
-
-            update_job(job_id, stage="Preparing Drive output folder...")
-            corrected_folder_id = find_or_create_corrected_folder(
-                service,
-                str(form["students_folder_id"]),
-                corrected_folder_name,
-            )
-            update_job(job_id, corrected_folder_id=corrected_folder_id)
-
-            try:
-                for student, corrected_path in corrected_paths:
                     if job_cancel_requested(job_id):
                         trash_drive_file(service, corrected_folder_id)
                         update_job(
@@ -1487,33 +1510,22 @@ def run_correction_job(job_id: str, form: dict[str, object], credentials_data: d
                         )
                         return
 
-                    update_job(job_id, stage=f"Uploading {student['relative_path']}...")
-                    destination_folder_id = corrected_destination_folder(service, corrected_folder_id, student)
-                    upload_or_replace_file(service, destination_folder_id, corrected_path, XLSX_MIME_TYPE)
-
-                if job_cancel_requested(job_id):
-                    trash_drive_file(service, corrected_folder_id)
-                    update_job(
-                        job_id,
-                        status="cancelled",
-                        corrected_folder_id="",
-                        stage="Correction cancelled. No corrected folder was kept.",
-                    )
-                    return
-
-                update_job(job_id, stage="Uploading summary report...")
-                upload_summary_text(service, corrected_folder_id, summary_path)
-            except Exception:
-                if job_cancel_requested(job_id) and corrected_folder_id:
-                    trash_drive_file(service, corrected_folder_id)
-                    update_job(
-                        job_id,
-                        status="cancelled",
-                        corrected_folder_id="",
-                        stage="Correction cancelled. No corrected folder was kept.",
-                    )
-                    return
-                raise
+                    update_job(job_id, stage="Uploading summary report...")
+                    upload_summary_text(service, corrected_folder_id, summary_path)
+                except Exception:
+                    if job_cancel_requested(job_id) and corrected_folder_id:
+                        trash_drive_file(service, corrected_folder_id)
+                        update_job(
+                            job_id,
+                            status="cancelled",
+                            corrected_folder_id="",
+                            stage="Correction cancelled. No corrected folder was kept.",
+                        )
+                        return
+                    raise
+            finally:
+                template_wb.close()
+                gc.collect()
 
         update_job(
             job_id,

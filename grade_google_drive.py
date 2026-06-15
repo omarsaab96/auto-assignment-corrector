@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import re
 import tempfile
 from dataclasses import replace
@@ -291,26 +292,30 @@ def main() -> int:
 
         template_path = temp_dir / template_file["name"]
         download_file(service, template_file["id"], template_path)
-        template_wb = load_workbook(template_path)
+        template_wb = load_workbook(template_path, read_only=True, keep_links=False)
+        try:
+            all_differences: list[Difference] = []
+            grade_args = make_grade_args(args)
 
-        all_differences: list[Difference] = []
-        grade_args = make_grade_args(args)
-
-        for student_file in student_files:
-            student_source_dir = students_dir / student_file["id"]
-            student_source_dir.mkdir()
-            student_path = student_source_dir / student_file["name"]
-            download_file(service, student_file["id"], student_path)
-            differences = grade_workbook(template_wb, student_path, corrected_dir, grade_args)
-            labeled_differences = [
-                replace(diff, workbook=student_file["relative_path"])
-                for diff in differences
-            ]
-            all_differences.extend(labeled_differences)
-            corrected_path = corrected_dir / student_path.name
-            destination_folder_id = corrected_destination_folder(service, corrected_folder_id, student_file)
-            upload_or_replace_file(service, destination_folder_id, corrected_path, XLSX_MIME_TYPE)
-            print(f"{student_file['relative_path']}: {len(differences)} difference(s)")
+            for student_file in student_files:
+                student_source_dir = students_dir / student_file["id"]
+                student_source_dir.mkdir()
+                student_path = student_source_dir / student_file["name"]
+                download_file(service, student_file["id"], student_path)
+                differences = grade_workbook(template_wb, student_path, corrected_dir, grade_args)
+                labeled_differences = [
+                    replace(diff, workbook=student_file["relative_path"])
+                    for diff in differences
+                ]
+                all_differences.extend(labeled_differences)
+                corrected_path = corrected_dir / student_path.name
+                destination_folder_id = corrected_destination_folder(service, corrected_folder_id, student_file)
+                upload_or_replace_file(service, destination_folder_id, corrected_path, XLSX_MIME_TYPE)
+                print(f"{student_file['relative_path']}: {len(differences)} difference(s)")
+                gc.collect()
+        finally:
+            template_wb.close()
+            gc.collect()
 
         summary_path = write_summary(corrected_dir, all_differences)
         upload_summary_text(service, corrected_folder_id, summary_path)
