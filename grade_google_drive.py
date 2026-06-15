@@ -292,7 +292,7 @@ def main() -> int:
 
         template_path = temp_dir / template_file["name"]
         download_file(service, template_file["id"], template_path)
-        template_wb = load_workbook(template_path, read_only=True, keep_links=False)
+        template_wb = load_workbook(template_path, read_only=True, data_only=True, keep_links=False)
         try:
             template_value_cache(template_wb)
             all_differences: list[Difference] = []

@@ -73,14 +73,6 @@ def read_only_non_empty_values(worksheet) -> dict[tuple[int, int], object]:
     return values
 
 
-def editable_non_empty_values(worksheet) -> dict[tuple[int, int], object]:
-    values: dict[tuple[int, int], object] = {}
-    for position, cell in worksheet._cells.items():
-        if cell.value is not None:
-            values[position] = cell.value
-    return values
-
-
 def template_value_cache(template_wb) -> dict[str, dict[tuple[int, int], object]]:
     cached = getattr(template_wb, "_assignment_corrector_value_cache", None)
     if cached is not None:
@@ -125,6 +117,7 @@ def grade_workbook(template_wb, student_path: Path, corrected_dir: Path, args: a
     shutil.copy2(student_path, output_path)
 
     student_wb = load_workbook(output_path, keep_links=False)
+    student_values_wb = load_workbook(output_path, read_only=True, data_only=True, keep_links=False)
     differences: list[Difference] = []
 
     try:
@@ -144,7 +137,7 @@ def grade_workbook(template_wb, student_path: Path, corrected_dir: Path, args: a
                 continue
 
             student_ws = student_wb[sheet_name]
-            student_values = editable_non_empty_values(student_ws)
+            student_values = read_only_non_empty_values(student_values_wb[sheet_name])
 
             for row, column in sorted(template_values.keys() | student_values.keys()):
                 expected = template_values.get((row, column))
@@ -182,6 +175,7 @@ def grade_workbook(template_wb, student_path: Path, corrected_dir: Path, args: a
         add_report_sheet(student_wb, differences)
         student_wb.save(output_path)
     finally:
+        student_values_wb.close()
         student_wb.close()
         gc.collect()
 
@@ -265,7 +259,7 @@ def main() -> int:
         return 1
 
     corrected_dir.mkdir(parents=True, exist_ok=True)
-    template_wb = load_workbook(template_path, read_only=True, keep_links=False)
+    template_wb = load_workbook(template_path, read_only=True, data_only=True, keep_links=False)
     try:
         all_differences: list[Difference] = []
         graded_count = 0

@@ -1334,7 +1334,7 @@ def grade_drive_files(service, form: dict[str, object], template: dict, students
 
         template_path = temp_dir / template["name"]
         download_file(service, template["id"], template_path)
-        template_wb = load_workbook(template_path, read_only=True, keep_links=False)
+        template_wb = load_workbook(template_path, read_only=True, data_only=True, keep_links=False)
         try:
             template_value_cache(template_wb)
             grade_args = SimpleNamespace(ignore_case=form["ignore_case"], trim_text=form["trim_text"])
@@ -1461,7 +1461,7 @@ def run_correction_job(job_id: str, form: dict[str, object], credentials_data: d
 
             template_path = temp_dir / template["name"]
             download_file(service, template["id"], template_path)
-            template_wb = load_workbook(template_path, read_only=True, keep_links=False)
+            template_wb = load_workbook(template_path, read_only=True, data_only=True, keep_links=False)
             try:
                 update_job(job_id, stage="Reading solution workbook values...")
                 template_value_cache(template_wb)
