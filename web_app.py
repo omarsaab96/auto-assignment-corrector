@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 import tempfile
@@ -18,7 +19,7 @@ from googleapiclient.discovery import build
 from openpyxl import load_workbook
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from grade_assignments import DEFAULT_TEMPLATE_NAME, Difference, grade_workbook, write_summary
+from grade_assignments import DEFAULT_TEMPLATE_NAME, Difference, grade_workbook
 from grade_google_drive import (
     DEFAULT_CORRECTED_FOLDER_PREFIX,
     FOLDER_MIME_TYPE,
@@ -38,6 +39,10 @@ from grade_google_drive import (
     upload_or_replace_file,
     upload_summary_text,
 )
+
+
+SUMMARY_HEADERS = ["workbook", "sheet", "cell", "issue", "expected", "actual"]
+SUMMARY_PREVIEW_LIMIT = 200
 
 
 app = Flask(__name__)
@@ -702,7 +707,7 @@ PAGE = """
       <section class="panel" style="margin-top:18px;">
         <div class="summary">
           <div class="metric"><strong>{{ result.graded_count }}</strong><span>workbooks corrected</span></div>
-          <div class="metric"><strong>{{ result.differences|length }}</strong><span>different cells or sheets</span></div>
+          <div class="metric"><strong>{{ result.total_differences }}</strong><span>different cells or sheets</span></div>
           <div class="metric"><strong>{{ result.corrected_folder_name }}</strong><span>Drive output folder</span></div>
         </div>
 
@@ -1231,6 +1236,32 @@ def load_drive_files(service, form: dict[str, object]):
     return template, students
 
 
+def create_summary_file(corrected_dir: Path) -> Path:
+    summary_path = corrected_dir / "grading_summary.csv"
+    with summary_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(SUMMARY_HEADERS)
+    return summary_path
+
+
+def append_summary_rows(summary_path: Path, workbook_name: str, differences: list[Difference]) -> None:
+    with summary_path.open("a", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        for diff in differences:
+            writer.writerow([workbook_name, diff.sheet, diff.cell, diff.issue, diff.expected, diff.actual])
+
+
+def add_preview_differences(
+    preview: list[Difference],
+    workbook_name: str,
+    differences: list[Difference],
+) -> None:
+    remaining = SUMMARY_PREVIEW_LIMIT - len(preview)
+    if remaining <= 0:
+        return
+    preview.extend(replace(diff, workbook=workbook_name) for diff in differences[:remaining])
+
+
 def grade_drive_files(service, form: dict[str, object], template: dict, students: list[dict]) -> dict[str, object]:
     corrected_folder_name = resolve_corrected_folder_name(str(form["corrected_folder_name"]))
     corrected_folder_id = find_or_create_corrected_folder(
@@ -1251,31 +1282,37 @@ def grade_drive_files(service, form: dict[str, object], template: dict, students
         template_wb = load_workbook(template_path)
         grade_args = SimpleNamespace(ignore_case=form["ignore_case"], trim_text=form["trim_text"])
 
-        all_differences: list[Difference] = []
+        preview_differences: list[Difference] = []
         difference_counts: dict[str, int] = {}
+        total_differences = 0
+        summary_path = create_summary_file(corrected_dir)
 
         for student in students:
             student_source_dir = students_dir / student["id"]
             student_source_dir.mkdir()
             student_path = student_source_dir / student["name"]
             download_file(service, student["id"], student_path)
-            differences = grade_workbook(template_wb, student_path, corrected_dir, grade_args)
+            student_corrected_dir = corrected_dir / student["id"]
+            student_corrected_dir.mkdir()
+            differences = grade_workbook(template_wb, student_path, student_corrected_dir, grade_args)
             difference_counts[student["relative_path"]] = len(differences)
-            all_differences.extend(replace(diff, workbook=student["relative_path"]) for diff in differences)
+            total_differences += len(differences)
+            append_summary_rows(summary_path, student["relative_path"], differences)
+            add_preview_differences(preview_differences, student["relative_path"], differences)
 
-            corrected_path = corrected_dir / student_path.name
+            corrected_path = student_corrected_dir / student_path.name
             destination_folder_id = corrected_destination_folder(service, corrected_folder_id, student)
             upload_or_replace_file(service, destination_folder_id, corrected_path, XLSX_MIME_TYPE)
 
-        summary_path = write_summary(corrected_dir, all_differences)
         upload_summary_text(service, corrected_folder_id, summary_path)
 
     return {
         "graded_count": len(students),
         "corrected_folder_id": corrected_folder_id,
         "corrected_folder_name": corrected_folder_name,
-        "differences": all_differences,
+        "differences": preview_differences,
         "difference_counts": difference_counts,
+        "total_differences": total_differences,
     }
 
 
@@ -1345,8 +1382,9 @@ def run_correction_job(job_id: str, form: dict[str, object], credentials_data: d
             template_wb = load_workbook(template_path)
             grade_args = SimpleNamespace(ignore_case=form["ignore_case"], trim_text=form["trim_text"])
 
-            all_differences: list[Difference] = []
             corrected_paths: list[tuple[dict, Path]] = []
+            total_differences = 0
+            summary_path = create_summary_file(corrected_dir)
 
             for index, student in enumerate(students):
                 if job_cancel_requested(job_id):
@@ -1362,13 +1400,17 @@ def run_correction_job(job_id: str, form: dict[str, object], credentials_data: d
                 student_path = student_source_dir / student["name"]
                 download_file(service, student["id"], student_path)
 
-                differences = grade_workbook(template_wb, student_path, corrected_dir, grade_args)
-                all_differences.extend(replace(diff, workbook=student["relative_path"]) for diff in differences)
-                corrected_path = corrected_dir / student_path.name
+                student_corrected_dir = corrected_dir / student["id"]
+                student_corrected_dir.mkdir()
+                differences = grade_workbook(template_wb, student_path, student_corrected_dir, grade_args)
+                total_differences += len(differences)
+                append_summary_rows(summary_path, student["relative_path"], differences)
+                corrected_path = student_corrected_dir / student_path.name
                 corrected_paths.append((student, corrected_path))
 
                 with JOBS_LOCK:
                     JOBS[job_id]["completed"] += 1
+                    JOBS[job_id]["total_differences"] = total_differences
                 update_submission(job_id, index, status="done", differences=len(differences))
 
             if job_cancel_requested(job_id):
@@ -1410,7 +1452,6 @@ def run_correction_job(job_id: str, form: dict[str, object], credentials_data: d
                     return
 
                 update_job(job_id, stage="Uploading summary report...")
-                summary_path = write_summary(corrected_dir, all_differences)
                 upload_summary_text(service, corrected_folder_id, summary_path)
             except Exception:
                 if job_cancel_requested(job_id) and corrected_folder_id:
@@ -1429,7 +1470,7 @@ def run_correction_job(job_id: str, form: dict[str, object], credentials_data: d
             status="done",
             stage="Correction complete.",
             error=None,
-            total_differences=len(all_differences),
+            total_differences=total_differences,
         )
     except Exception as exc:
         if current_index is not None:
