@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import tempfile
 import threading
 import uuid
 from copy import deepcopy
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,6 +45,8 @@ from grade_google_drive import (
 
 SUMMARY_HEADERS = ["workbook", "sheet", "cell", "issue", "expected", "actual"]
 SUMMARY_PREVIEW_LIMIT = 200
+
+logging.basicConfig(level=logging.INFO)
 
 
 app = Flask(__name__)
@@ -775,6 +779,7 @@ PAGE = """
     const outputFolderNameIcon = document.getElementById("output-folder-name-icon");
     const correctedFolderName = document.getElementById("corrected-folder-name");
     const latestOnlyIcon = document.getElementById("latest-only-icon");
+    const pollRetryLimit = 8;
     let activeJobId = null;
     let correctionCancelled = false;
 
@@ -1015,16 +1020,36 @@ PAGE = """
       }
     }
 
-    async function pollJob(jobId) {
+    async function readJsonResponse(response) {
+      try {
+        return await response.json();
+      } catch (_) {
+        return {};
+      }
+    }
+
+    async function pollJob(jobId, failedPolls = 0) {
       const response = await fetch(`/api/correction/status/${encodeURIComponent(jobId)}`);
-      const job = await response.json();
+      const job = await readJsonResponse(response);
       if (!response.ok) {
+        if (!correctionCancelled && response.status >= 502 && failedPolls < pollRetryLimit) {
+          const delay = Math.min(1200 * (failedPolls + 1), 8000);
+          progressStage.textContent = "Waiting for the server to respond...";
+          window.setTimeout(() => pollJob(jobId, failedPolls + 1).catch((error) => {
+            progressLoader.classList.add("hidden");
+            showProgressMessage("error", error.message);
+          }), delay);
+          return;
+        }
+        if (response.status >= 502) {
+          throw new Error("Render stopped responding while checking progress. The job may have restarted or exceeded the service limits; check the Render logs for the exact backend error.");
+        }
         throw new Error(job.error || "Unable to read correction progress.");
       }
 
       renderJob(job);
       if (!correctionCancelled && (job.status === "running" || job.status === "queued")) {
-        window.setTimeout(() => pollJob(jobId).catch((error) => {
+        window.setTimeout(() => pollJob(jobId, 0).catch((error) => {
           progressLoader.classList.add("hidden");
           showProgressMessage("error", error.message);
         }), 900);
@@ -1262,6 +1287,10 @@ def add_preview_differences(
     preview.extend(replace(diff, workbook=workbook_name) for diff in differences[:remaining])
 
 
+def utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 def grade_drive_files(service, form: dict[str, object], template: dict, students: list[dict]) -> dict[str, object]:
     corrected_folder_name = resolve_corrected_folder_name(str(form["corrected_folder_name"]))
     corrected_folder_id = find_or_create_corrected_folder(
@@ -1323,15 +1352,29 @@ def job_snapshot(job_id: str) -> dict | None:
 
 
 def update_job(job_id: str, **updates) -> None:
+    updates["updated_at"] = utc_timestamp()
+    snapshot = None
     with JOBS_LOCK:
         if job_id in JOBS:
             JOBS[job_id].update(updates)
+            snapshot = dict(JOBS[job_id])
+
+    if snapshot and ("stage" in updates or "status" in updates):
+        app.logger.info(
+            "correction job %s status=%s completed=%s/%s stage=%s",
+            job_id,
+            snapshot.get("status"),
+            snapshot.get("completed"),
+            snapshot.get("total"),
+            snapshot.get("stage"),
+        )
 
 
 def update_submission(job_id: str, index: int, **updates) -> None:
     with JOBS_LOCK:
         if job_id in JOBS and 0 <= index < len(JOBS[job_id]["submissions"]):
             JOBS[job_id]["submissions"][index].update(updates)
+            JOBS[job_id]["updated_at"] = utc_timestamp()
 
 
 def job_cancel_requested(job_id: str) -> bool:
@@ -1347,11 +1390,18 @@ def run_correction_job(job_id: str, form: dict[str, object], credentials_data: d
     current_index = None
     corrected_folder_id = ""
     try:
+        app.logger.info("correction job %s started", job_id)
         update_job(job_id, status="running", stage="Connecting to Google Drive...")
         service = get_drive_service(credentials_data)
 
         update_job(job_id, stage="Finding solution workbook and submissions...")
         template, students = load_drive_files(service, form)
+        app.logger.info(
+            "correction job %s found template=%s submissions=%s",
+            job_id,
+            template.get("name"),
+            len(students),
+        )
         corrected_folder_name = resolve_corrected_folder_name(str(form["corrected_folder_name"]))
 
         submissions = [
@@ -1472,7 +1522,15 @@ def run_correction_job(job_id: str, form: dict[str, object], credentials_data: d
             error=None,
             total_differences=total_differences,
         )
+        app.logger.info(
+            "correction job %s finished submissions=%s total_differences=%s corrected_folder_id=%s",
+            job_id,
+            len(students),
+            total_differences,
+            corrected_folder_id,
+        )
     except Exception as exc:
+        app.logger.exception("correction job %s failed", job_id)
         if current_index is not None:
             update_submission(job_id, current_index, status="error")
         update_job(job_id, status="error", stage="Correction failed.", error=str(exc))
@@ -1594,11 +1652,14 @@ def api_correction_start():
         return jsonify({"error": "Sign in with Google Drive first."}), 401
 
     job_id = uuid.uuid4().hex
+    now = utc_timestamp()
     with JOBS_LOCK:
         JOBS[job_id] = {
             "id": job_id,
             "status": "queued",
             "stage": "Queued...",
+            "created_at": now,
+            "updated_at": now,
             "completed": 0,
             "total": 0,
             "submissions": [],
@@ -1618,7 +1679,7 @@ def api_correction_start():
 def api_correction_status(job_id: str):
     job = job_snapshot(job_id)
     if not job:
-        return jsonify({"error": "Correction job not found."}), 404
+        return jsonify({"error": "Correction job not found. The server may have restarted while it was running."}), 404
     return jsonify(job)
 
 
